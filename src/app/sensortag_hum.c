@@ -58,6 +58,7 @@
 #include "humidityservice.h"
 #include "sensortag_hum.h"
 #include "SensorHdc1000.h"
+#include "SensorOpt3001.h"
 #include "sensortag.h"
 #include "SensorTagTest.h"
 #include "SensorUtil.h"
@@ -78,6 +79,12 @@
 
 // Time start measurement and data ready
 #define HUM_DELAY_PERIOD        15
+#define BEACON_READ_PERIOD      60000   // ms between readings in beacon mode
+#define CONNECT_READ_PERIOD     5000    // ms between readings in connect mode
+#define OPT_CONVERSION_DELAY    120     // one 100 ms OPT3001 conversion plus margin
+
+extern void SensorTag_beaconReading(uint16_t rawTemp, uint16_t rawHum, uint16_t rawLux);
+extern bool SensorTag_connectMode(void);
 
 // Length of the data for this sensor
 #define SENSOR_DATA_LEN         HUMIDITY_DATA_LEN
@@ -222,9 +229,6 @@ void SensorTagHum_processCharChangeEvt(uint8_t paramID)
         
         // Reset characteristics
         initCharacteristicValue(SENSOR_DATA, 0, SENSOR_DATA_LEN);
-
-        // Deactivate task
-        Task_setPri(Task_handle(&sensorTask), -1);
       }
       else if (newValue == ST_CFG_SENSOR_ENABLE)
       {
@@ -303,8 +307,8 @@ static void sensorTaskFxn(UArg a0, UArg a1)
   // Register task with BLE stack
   ICall_registerApp(&sensorSelfEntity, &sensorSem);
 
-  // Deactivate task (active only when measurement is enabled)
-  Task_setPri(Task_handle(&sensorTask), -1);
+  // Let the main task finish the power-on self-test first
+  DELAY_MS(SENSOR_DEFAULT_PERIOD);
 
   // Task loop
   while (true)
@@ -325,6 +329,46 @@ static void sensorTaskFxn(UArg a0, UArg a1)
 
       // 4. Wait until next cycle
       DELAY_MS(sensorPeriod - HUM_DELAY_PERIOD);
+    }
+    else if (gapProfileState != GAPROLE_CONNECTED)
+    {
+      // Beacon reading; a connected client owns the sensors instead
+      uint16_t rawTemp = 0xFFFF, rawHum = 0xFFFF, rawLux = 0xFFFF;
+      uint32_t waited;
+      uint8_t ok = SensorTag_testResult();
+
+      if (ok & SENSOR_OPT_TEST_BM)
+      {
+        SensorOpt3001_enable(true);
+      }
+      if (ok & SENSOR_HUM_TEST_BM)
+      {
+        SensorHdc1000_start();
+        DELAY_MS(HUM_DELAY_PERIOD);
+        if (!SensorHdc1000_read(&rawTemp, &rawHum))
+        {
+          rawTemp = rawHum = 0xFFFF;
+        }
+      }
+      if (ok & SENSOR_OPT_TEST_BM)
+      {
+        DELAY_MS(OPT_CONVERSION_DELAY);
+        if (!SensorOpt3001_read(&rawLux))
+        {
+          rawLux = 0xFFFF;
+        }
+        SensorOpt3001_enable(false);
+      }
+      SensorTag_beaconReading(rawTemp, rawHum, rawLux);
+      for (waited = 0; waited < BEACON_READ_PERIOD && !SensorTag_connectMode();
+           waited += CONNECT_READ_PERIOD)
+      {
+        DELAY_MS(CONNECT_READ_PERIOD);
+      }
+      if (waited == 0)
+      {
+        DELAY_MS(CONNECT_READ_PERIOD);
+      }
     }
     else
     {

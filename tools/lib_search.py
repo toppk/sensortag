@@ -194,9 +194,9 @@ def parseOPT(opt, variables):
                     # Must check assignments and match those in cfg
                     else:
                         if len(fragments) < 2:
-                            print "<<< ERROR >>>"
-                            print "Assignment required for " + fragments[0]
-                            print "<<< /ERROR >>>"
+                            print("<<< ERROR >>>")
+                            print("Assignment required for " + fragments[0])
+                            print("<<< /ERROR >>>")
                             sys.exit(1)
 
                         # Remove DCAs from Assignment (DCA = Don't Care Argument)
@@ -221,11 +221,11 @@ def parseOPT(opt, variables):
 
                                 # No Permutations found so it must be incomplete
                                 if not permFound:
-                                    print "<<< ERROR >>>"
-                                    print "Cannot match given assignment " + fragments[1] + " to any possible value:"
+                                    print("<<< ERROR >>>")
+                                    print("Cannot match given assignment " + fragments[1] + " to any possible value:")
                                     for arg in args:
-                                        print "\t" + arg
-                                    print "<<< /ERROR >>>"
+                                        print("\t" + arg)
+                                    print("<<< /ERROR >>>")
                                     sys.exit(1)
                             line += '\n'
                         else:
@@ -337,7 +337,7 @@ def lib_search(opt, xml, libdir, config, verbose=True):
     for lib_name in lib_names:
         # Parse template file to determine config parameters to match against
         (relPath, addConfig, params) = parseXML(lib_name, xml)
-        path = os.path.join(libdir, relPath)
+        path = os.path.join(libdir, relPath.replace("\\", "/"))
         config = ""
         if addConfig and addConfig != "0":
             config += config
@@ -351,21 +351,21 @@ def lib_search(opt, xml, libdir, config, verbose=True):
         # Add matched_lib to final libs list
         if verbose:
             if matched_lib and os.path.exists(matched_lib):
-                print "<<< Using Library: " + os.path.basename(matched_lib) + " >>>"
+                print("<<< Using Library: " + os.path.basename(matched_lib) + " >>>")
                 final_libs.append(matched_lib)
             elif matched_lib and not os.path.exists(matched_lib):
-                print "<<< ERROR >>>"
-                print "\tMatched the project .opt file to a library .opt file."
-                print "\tHowever, unable to find corresponding library file \n\t" + matched_lib
-                print "<<< /ERROR >>>"
+                print("<<< ERROR >>>")
+                print("\tMatched the project .opt file to a library .opt file.")
+                print("\tHowever, unable to find corresponding library file \n\t" + matched_lib)
+                print("<<< /ERROR >>>")
                 return None
             else:
-                print "<<< ERROR >>>"
-                print "Cannot match " + opt + " to any library .opt file in " + path
-                print "\tSearched against the following defines in " + opt + ": "
+                print("<<< ERROR >>>")
+                print("Cannot match " + opt + " to any library .opt file in " + path)
+                print("\tSearched against the following defines in " + opt + ": ")
                 for optparam in optparams:
-                    print "\t\t\"" + optparam.strip() + "\""
-                print "<<< /ERROR >>>"
+                    print("\t\t\"" + optparam.strip() + "\"")
+                print("<<< /ERROR >>>")
                 return None
         elif matched_lib:
             final_libs.append(matched_lib)
@@ -397,9 +397,9 @@ def main():
     # If valid libraries were found generate linker cmd file
     if final_libs:
         if generateCmd(args.cmd, final_libs):
-            print "<<< Modifying " + os.path.basename(args.cmd) + ". Stack configurations have changed. >>>"
+            print("<<< Modifying " + os.path.basename(args.cmd) + ". Stack configurations have changed. >>>")
         else:
-            print "<<< Not Modifying " + os.path.basename(args.cmd) + ". Stack configurations have not changed. >>>"
+            print("<<< Not Modifying " + os.path.basename(args.cmd) + ". Stack configurations have not changed. >>>")
 
     return
 

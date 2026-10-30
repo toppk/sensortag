@@ -70,6 +70,9 @@
 #include "icall_apimsg.h"
 
 #include "SensorI2C.h"
+#include <driverlib/aon_batmon.h>
+#include <driverlib/aon_rtc.h>
+#include <driverlib/sys_ctrl.h>
 #include "SensorTagTest.h"
 #include "sensortag_revision.h"
 #include "Board.h"
@@ -108,12 +111,31 @@
 // How often to perform periodic event (in milliseconds)
 #define ST_PERIODIC_EVT_PERIOD               1000
 
-// What is the advertising interval when device is discoverable
-// (units of 625us, 160=100ms)
-#define DEFAULT_ADVERTISING_INTERVAL          160
+// Connect-mode advertising interval; readings change every 5 s, so once a second is plenty
+// (units of 625us, 1600=1s)
+#define DEFAULT_ADVERTISING_INTERVAL          1600
 
 // General discoverable mode advertises indefinitely
 #define DEFAULT_DISCOVERABLE_MODE             GAP_ADTYPE_FLAGS_LIMITED
+
+// Beacon mode: each reading goes out as a short non-connectable burst, then the radio is quiet
+// (units of 625us, 2400=1.5s)
+#define BURST_ADVERTISING_INTERVAL            2400
+#define BURST_PERIOD                          3750    // ms; adverts at 0, 1.5 and 3 s
+// Bluetooth SIG company ID reserved for internal and test use
+#define BEACON_COMPANY_ID                     0xFFFF
+// A message's first byte: format in the low nibble, flags in the high nibble (unused ones 0)
+#define BEACON_FORMAT                         0x01
+#define INFO_FORMAT                           0x02
+#define FLAG_CONNECT_MODE                     0x10
+#define INFO_PERIOD                           15000   // ms the info packet replaces readings
+#define INFO_ADVERTISING_INTERVAL             160     // 100 ms, so scanners hear the press at once
+#ifndef BUILD_GIT
+#define BUILD_GIT                             0
+#define BUILD_DIRTY                           1
+#define FW_VERSION_X100                       0
+#define BLE_SDK_VERSION                       0
+#endif
 
 // Minimum connection interval (units of 1.25ms, 80=100ms) if automatic
 // parameter update request is enabled
@@ -162,12 +184,21 @@
 #define ST_CHAR_CHANGE_EVT                    0x0002
 #define ST_PERIODIC_EVT                       0x0004
 #define SBP_OAD_WRITE_EVT                     0x0008
+#define ST_BEACON_EVT                         0x0010
+#define ST_INFO_END_EVT                       0x0020
+#define ST_BURST_END_EVT                      0x0040
 
 // Misc.
 #define INVALID_CONNHANDLE                    0xFFFF
 #define TEST_INDICATION_BLINKS                5  // Number of blinks
 #define OAD_PACKET_SIZE                       18
-#define KEY_STATE_OFFSET                      13 // Offset in advertising data
+#define FLAGS_OFFSET                          2  // Offsets in advertising data
+#define FORMAT_OFFSET                         7
+#define BEACON_SEQ_OFFSET                     8
+
+// Which advertising runs when not connected
+#define ADV_MODE_BEACON                       0
+#define ADV_MODE_CONNECTABLE                  1
 
 /*******************************************************************************
  * TYPEDEFS
@@ -251,29 +282,55 @@ static uint8_t scanRspData[] =
 // best kept short to conserve power while advertising)
 static uint8_t advertData[] =
 {
-  // Flags; this sets the device to use limited discoverable
-  // mode (advertises for 30 seconds at a time) instead of general
-  // discoverable mode (advertises indefinitely)
+  // Flags; limited discoverable in the connectable window, none as a beacon
   0x02,   // length of this data
   GAP_ADTYPE_FLAGS,
-  DEFAULT_DISCOVERABLE_MODE | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
+  GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
 
-  // service UUID, to notify central devices what services are included
-  // in this peripheral
-  0x03,   // length of this data
-  GAP_ADTYPE_16BIT_MORE,      // some of the UUID's, but not all
-  LO_UINT16(BATT_SERV_UUID),
-  HI_UINT16(BATT_SERV_UUID),
-
-  // Manufacturer specific advertising data
-  0x06,
+  // Readings, little-endian; 0xFFFF where a sensor didn't answer
+  0x0D,   // length of this data
   GAP_ADTYPE_MANUFACTURER_SPECIFIC,
-  LO_UINT16(TI_COMPANY_ID),
-  HI_UINT16(TI_COMPANY_ID),
-  TI_ST_DEVICE_ID,
-  TI_ST_KEY_DATA_ID,
-  0x00                                    // Key state
+  LO_UINT16(BEACON_COMPANY_ID),
+  HI_UINT16(BEACON_COMPANY_ID),
+  BEACON_FORMAT,
+  0x00,                                   // sequence, bumped with each reading
+  0xFF, 0xFF,                             // HDC1000 raw temperature
+  0xFF, 0xFF,                             // HDC1000 raw humidity
+  0xFF, 0xFF,                             // OPT3001 raw light
+  0x00, 0x00                              // battery, volts in 8.8 fixed point
 };
+
+// Sent for INFO_PERIOD after a button 2 press, in place of advertData
+static uint8_t infoData[] =
+{
+  0x02,   // length of this data
+  GAP_ADTYPE_FLAGS,
+  GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
+
+  0x19,   // length of this data
+  GAP_ADTYPE_MANUFACTURER_SPECIFIC,
+  LO_UINT16(BEACON_COMPANY_ID),
+  HI_UINT16(BEACON_COMPANY_ID),
+  INFO_FORMAT,
+  0x00,                                   // 8: button 2 presses since boot
+  0x00, 0x00,                             // 9: app version, FW_VERSION * 100 (150 = 1.50)
+  0x00, 0x00, 0x00, 0x00,                 // 11: git commit the app was built from
+  0x00,                                   // 15: 1 if built with uncommitted changes
+  0x00, 0x00, 0x00,                       // 16: BLE SDK (stack) version, major minor patch
+  0x00, 0x00, 0x00, 0x00,                 // 19: stack start address it was linked against
+  0x00,                                   // 23: power-on self-test map
+  0x00,                                   // 24: reset source
+  0x00, 0x00, 0x00, 0x00                  // 25: uptime, seconds
+};
+static bool infoActive = false;
+static Clock_Struct infoClock;
+static bool burstActive = false;
+static Clock_Struct burstClock;
+static uint16_t beaconInterval = 0;   // interval the running beacon advertising uses
+
+static uint8_t advMode = ADV_MODE_BEACON;
+static bool advSwitching = false;
+static volatile uint16_t beaconRaw[3] = {0xFFFF, 0xFFFF, 0xFFFF};
 
 // Device information parameters
 #ifdef CC1350STK
@@ -319,6 +376,12 @@ static void SensorTag_clockHandler(UArg arg);
 static void SensorTag_enqueueMsg(uint8_t event, uint8_t serviceID, uint8_t paramID);
 static void SensorTag_callback(PIN_Handle handle, PIN_Id pinId);
 static void SensorTag_setDeviceInfo(void);
+static void SensorTag_updateBeacon(void);
+static void SensorTag_pushAdvertData(void);
+static void put32(uint8_t *p, uint32_t v);
+static void SensorTag_setAdvInterval(uint16_t advInt);
+static void SensorTag_startAdvertising(void);
+static void SensorTag_refreshBeacon(void);
 
 /*******************************************************************************
  * PROFILE CALLBACKS
@@ -411,14 +474,18 @@ static void SensorTag_init(void)
   // Create one-shot clocks for internal periodic events.
   Util_constructClock(&periodicClock, SensorTag_clockHandler,
                       ST_PERIODIC_EVT_PERIOD, 0, false, ST_PERIODIC_EVT);
+  Util_constructClock(&infoClock, SensorTag_clockHandler,
+                      INFO_PERIOD, 0, false, ST_INFO_END_EVT);
+  Util_constructClock(&burstClock, SensorTag_clockHandler,
+                      BURST_PERIOD, 0, false, ST_BURST_END_EVT);
 
   // Setup the GAP
   GAP_SetParamValue(TGAP_CONN_PAUSE_PERIPHERAL, DEFAULT_CONN_PAUSE_PERIPHERAL);
 
   // Setup the GAP Peripheral Role Profile
   {
-    // For all hardware platforms, device starts advertising upon initialization
-    uint8_t initialAdvertEnable = TRUE;
+    // Beacon advertising starts once the role is up (GAPROLE_STARTED)
+    uint8_t initialAdvertEnable = FALSE;
 
     // By setting this to zero, the device will go into the waiting state after
     // being discoverable for 30.72 second, and will not being advertising again
@@ -626,6 +693,27 @@ static void SensorTag_taskFxn(UArg a0, UArg a1)
       SensorTagBatt_processSensorEvent();
     }
 
+    if (!!(events & ST_BEACON_EVT))
+    {
+      events &= ~ST_BEACON_EVT;
+      SensorTag_updateBeacon();
+    }
+
+    if (!!(events & ST_INFO_END_EVT))
+    {
+      events &= ~ST_INFO_END_EVT;
+      infoActive = false;
+      SensorTag_pushAdvertData();
+      SensorTag_refreshBeacon();
+    }
+
+    if (!!(events & ST_BURST_END_EVT))
+    {
+      events &= ~ST_BURST_END_EVT;
+      burstActive = false;
+      SensorTag_refreshBeacon();
+    }
+
     if (!!(events & ST_PERIODIC_EVT))
     {
       events &= ~ST_PERIODIC_EVT;
@@ -762,6 +850,9 @@ static void SensorTag_processStateChangeEvt(gaprole_States_t newState)
       systemId[5] = ownAddress[3];
 
       DevInfo_SetParameter(DEVINFO_SYSTEM_ID, DEVINFO_SYSTEM_ID_LEN, systemId);
+
+      AONBatMonEnable();
+      SensorTag_refreshBeacon();
     }
     break;
 
@@ -813,7 +904,33 @@ static void SensorTag_processStateChangeEvt(gaprole_States_t newState)
 
   case GAPROLE_WAITING:
   case GAPROLE_WAITING_AFTER_TIMEOUT:
-    SensorTag_resetAllModules();
+    if (!advSwitching)
+    {
+      SensorTag_resetAllModules();
+    }
+    {
+      uint8_t connAdv;
+
+      // After a disconnect the role resumes connectable advertising itself
+      GAPRole_GetParameter(GAPROLE_ADVERT_ENABLED, &connAdv);
+      gapProfileState = newState;   // SensorTag_refreshBeacon reads it
+      if (!connAdv)
+      {
+        if (!advSwitching)
+        {
+          advMode = ADV_MODE_BEACON;
+        }
+        advSwitching = false;
+        if (advMode == ADV_MODE_CONNECTABLE)
+        {
+          SensorTag_startAdvertising();
+        }
+        else
+        {
+          SensorTag_refreshBeacon();
+        }
+      }
+    }
     break;
 
   case GAPROLE_ERROR:
@@ -1059,9 +1176,194 @@ static void SensorTag_callback(PIN_Handle handle, PIN_Id pinId)
  */
 void SensorTag_updateAdvertisingData(uint8_t keyStatus)
 {
-  // Record key state in advertising data
-  advertData[KEY_STATE_OFFSET] = keyStatus;
-  GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+  // Key state is no longer advertised; the beacon carries readings instead
+  SensorTag_pushAdvertData();
+}
+
+static void SensorTag_pushAdvertData(void)
+{
+  uint8_t flags = (advMode == ADV_MODE_CONNECTABLE) ? FLAG_CONNECT_MODE : 0;
+
+  advertData[FORMAT_OFFSET] = BEACON_FORMAT | flags;
+  infoData[FORMAT_OFFSET] = INFO_FORMAT | flags;
+  if (infoActive)
+  {
+    infoData[FLAGS_OFFSET] = advertData[FLAGS_OFFSET];
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(infoData), infoData);
+  }
+  else
+  {
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+  }
+}
+
+static void put32(uint8_t *p, uint32_t v)
+{
+  p[0] = v;
+  p[1] = v >> 8;
+  p[2] = v >> 16;
+  p[3] = v >> 24;
+}
+
+/*******************************************************************************
+ * @fn      SensorTag_leftKeyPressed
+ *
+ * @brief   Left button: blink red and announce the press in the beacon at once.
+ */
+void SensorTag_leftKeyPressed(void)
+{
+  uint16_t ver = FW_VERSION_X100;
+
+  infoData[8]++;
+  infoData[9] = LO_UINT16(ver);
+  infoData[10] = HI_UINT16(ver);
+  put32(infoData + 11, BUILD_GIT);
+  infoData[15] = BUILD_DIRTY;
+  infoData[16] = (BLE_SDK_VERSION >> 16) & 0xFF;
+  infoData[17] = (BLE_SDK_VERSION >> 8) & 0xFF;
+  infoData[18] = BLE_SDK_VERSION & 0xFF;
+  put32(infoData + 19, ICALL_STACK0_START);
+  infoData[23] = selfTestMap;
+  infoData[24] = SysCtrlResetSourceGet();
+  put32(infoData + 25, AONRTCSecGet());
+
+  SensorTagIO_blinkLed(IOID_RED_LED, 3);
+  infoActive = true;
+  SensorTag_pushAdvertData();
+  SensorTag_refreshBeacon();
+  Util_restartClock(&infoClock, INFO_PERIOD);
+}
+
+/*******************************************************************************
+ * @fn      SensorTag_beaconReading
+ *
+ * @brief   Called from the humidity task with fresh raw readings.
+ */
+void SensorTag_beaconReading(uint16_t rawTemp, uint16_t rawHum, uint16_t rawLux)
+{
+  beaconRaw[0] = rawTemp;
+  beaconRaw[1] = rawHum;
+  beaconRaw[2] = rawLux;
+  events |= ST_BEACON_EVT;
+  Semaphore_post(sem);
+}
+
+static void SensorTag_updateBeacon(void)
+{
+  uint8_t i;
+  uint8_t *p = advertData + BEACON_SEQ_OFFSET;
+  uint16_t batt = AONBatMonBatteryVoltageGet() & 0x7FF;
+
+  *p++ += 1;
+  for (i = 0; i < 3; i++)
+  {
+    *p++ = LO_UINT16(beaconRaw[i]);
+    *p++ = HI_UINT16(beaconRaw[i]);
+  }
+  *p++ = LO_UINT16(batt);
+  *p = HI_UINT16(batt);
+  SensorTag_pushAdvertData();
+  if (advMode == ADV_MODE_BEACON)
+  {
+    burstActive = true;
+    Util_restartClock(&burstClock, BURST_PERIOD);
+    SensorTag_refreshBeacon();
+  }
+}
+
+/*******************************************************************************
+ * @fn      SensorTag_connectMode
+ *
+ * @brief   True while the connect-mode window is open, for the sensor task's read period.
+ */
+bool SensorTag_connectMode(void)
+{
+  return advMode == ADV_MODE_CONNECTABLE;
+}
+
+static void SensorTag_setAdvInterval(uint16_t advInt)
+{
+  GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MIN, advInt);
+  GAP_SetParamValue(TGAP_LIM_DISC_ADV_INT_MAX, advInt);
+  GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MIN, advInt);
+  GAP_SetParamValue(TGAP_GEN_DISC_ADV_INT_MAX, advInt);
+  GAP_SetParamValue(TGAP_CONN_ADV_INT_MIN, advInt);
+  GAP_SetParamValue(TGAP_CONN_ADV_INT_MAX, advInt);
+}
+
+static void SensorTag_startAdvertising(void)
+{
+  uint8_t on = TRUE;
+
+  if (advMode == ADV_MODE_CONNECTABLE)
+  {
+    advertData[FLAGS_OFFSET] = DEFAULT_DISCOVERABLE_MODE
+                               | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED;
+    SensorTag_setAdvInterval(DEFAULT_ADVERTISING_INTERVAL);
+    SensorTag_pushAdvertData();
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &on);
+  }
+  else
+  {
+    advertData[FLAGS_OFFSET] = GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED;
+    beaconInterval = infoActive ? INFO_ADVERTISING_INTERVAL : BURST_ADVERTISING_INTERVAL;
+    SensorTag_setAdvInterval(beaconInterval);
+    SensorTag_pushAdvertData();
+    GAPRole_SetParameter(GAPROLE_ADV_NONCONN_ENABLED, sizeof(uint8_t), &on);
+  }
+}
+
+// Beacon mode advertises only during a burst or the info packet, at the interval that needs;
+// the interval only changes on a restart, which comes back through GAPROLE_WAITING
+static void SensorTag_refreshBeacon(void)
+{
+  uint8_t off = FALSE;
+  uint16_t want = infoActive ? INFO_ADVERTISING_INTERVAL
+                  : burstActive ? BURST_ADVERTISING_INTERVAL : 0;
+
+  if (advMode != ADV_MODE_BEACON || advSwitching)
+  {
+    return;
+  }
+  if (gapProfileState == GAPROLE_ADVERTISING_NONCONN)
+  {
+    if (want != beaconInterval)
+    {
+      advSwitching = true;
+      GAPRole_SetParameter(GAPROLE_ADV_NONCONN_ENABLED, sizeof(uint8_t), &off);
+    }
+  }
+  else if (want != 0)
+  {
+    SensorTag_startAdvertising();
+  }
+}
+
+/*******************************************************************************
+ * @fn      SensorTag_toggleConnectable
+ *
+ * @brief   Power button: open the connectable window (OAD, TI app) or close it.
+ *          The new mode starts from GAPROLE_WAITING once the old one has ended.
+ */
+void SensorTag_toggleConnectable(void)
+{
+  uint8_t off = FALSE;
+
+  advMode = (advMode == ADV_MODE_BEACON) ? ADV_MODE_CONNECTABLE : ADV_MODE_BEACON;
+  if (gapProfileState == GAPROLE_ADVERTISING)
+  {
+    advSwitching = true;
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &off);
+  }
+  else if (gapProfileState == GAPROLE_ADVERTISING_NONCONN)
+  {
+    advSwitching = true;
+    GAPRole_SetParameter(GAPROLE_ADV_NONCONN_ENABLED, sizeof(uint8_t), &off);
+  }
+  else
+  {
+    SensorTag_startAdvertising();
+  }
 }
 
 /*******************************************************************************

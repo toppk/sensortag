@@ -123,7 +123,7 @@ def parseXML(xml):
 
     # Search for Flash and RAM Boundaries
     for section in sections:
-        for node in section.getchildren():
+        for node in section[:]:
             if node.tag == 'name':
                 if node.text == 'FLASH':
                     # Flash section found, get address
@@ -141,7 +141,7 @@ def parseXML(xml):
     # Search for startup_entry
     objectSectionsName = linkerInfo.findall('symbol_table/symbol')
     for section in objectSectionsName:
-        for node in section.getchildren():
+        for node in section[:]:
             if node.tag == 'name':
                 if node.text == 'startup_entry':
                     # We found the entry section, let's read the value

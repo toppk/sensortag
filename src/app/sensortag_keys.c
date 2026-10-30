@@ -121,6 +121,8 @@ static uint8_t event;
  * LOCAL FUNCTIONS
  */
 static void processGapStateChange(void);
+extern void SensorTag_toggleConnectable(void);
+extern void SensorTag_leftKeyPressed(void);
 static void SensorTagKeys_clockHandler(UArg arg);
 #ifdef Board_RELAY
 static void configureRelay(void);
@@ -287,6 +289,12 @@ void SensorTagKeys_processEvent(void)
       keyRightTimer = 0;
     }
 
+    // Left key press: our own action, not in TI's firmware
+    if ((current_keys & SK_KEY_LEFT)==0 && (keys & SK_KEY_LEFT)!=0)
+    {
+      SensorTag_leftKeyPressed();
+    }
+
     // Insert key state into advertising data
     if (gapProfileState == GAPROLE_ADVERTISING)
     {
@@ -428,24 +436,8 @@ static void processGapStateChange(void)
 {
   if (gapProfileState != GAPROLE_CONNECTED)
   {
-    uint8_t current_adv_enabled_status;
-    uint8_t new_adv_enabled_status;
-
-    // Find the current GAP advertising status
-    GAPRole_GetParameter(GAPROLE_ADVERT_ENABLED, &current_adv_enabled_status);
-
-    if (current_adv_enabled_status == FALSE)
-    {
-      new_adv_enabled_status = TRUE;
-    }
-    else
-    {
-      new_adv_enabled_status = FALSE;
-    }
-
-    // Change the GAP advertisement status to opposite of current status
-    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),
-                         &new_adv_enabled_status);
+    // Switch between the beacon and the connectable window
+    SensorTag_toggleConnectable();
   }
 
   if (gapProfileState == GAPROLE_CONNECTED)

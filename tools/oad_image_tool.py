@@ -46,9 +46,8 @@
  *****************************************************************************/
 """
 
-# Needs python 2.7.10
-from __future__ import print_function
-import __builtin__
+import builtins as __builtin__
+import binascii
 import argparse
 import os
 import sys
@@ -56,12 +55,6 @@ import struct
 import textwrap
 import math
 from collections import namedtuple
-
-try:
-    import crcmod  # pip [--proxy <addr>] install crcmod
-except ImportError:
-    print("Could not load module 'crcmod'. Please install package. pip [--proxy <addr>] install crcmod")
-    sys.exit(1)
 
 try:
     from intelhex import IntelHex # pip [--proxy <addr>] install intelhex
@@ -73,7 +66,8 @@ except ImportError:
 tool_version = "1.0"
 # CRC related data
 # CRC Poly used by OAD for CC26xx
-crc16 = crcmod.mkCrcFun(0x11021, rev=False, initCrc=0x0000, xorOut=0x0000)
+def crc16(data):  # CRC-16/XMODEM, what crcmod built from 0x11021
+    return binascii.crc_hqx(data, 0)
 
 
 OAD_HDR_FMT = 'HHHH4sHBB'
@@ -116,11 +110,11 @@ def mem_usage(start_sect, stop_sect, segments, legalSegs=[], reqSegs=[], ih=None
             return min(r1[1]-1, r2[1]-1)-max(r1[0], r2[0])
         return 0
 
-    ret = '|'.join([' %02d ' % i for i in xrange(start_sect, stop_sect)]) + '\n'
+    ret = '|'.join([' %02d ' % i for i in range(start_sect, stop_sect)]) + '\n'
 
-    for line in xrange(4):
-        for sect in xrange(start_sect, stop_sect):
-            for col in xrange(4):
+    for line in range(4):
+        for sect in range(start_sect, stop_sect):
+            for col in range(4):
                 a = addr(sect, line, col)
                 overlap = max([calc_overlap([a, a + 256], seg) for seg in segments])
                 if overlap == 0: sym = '-'
@@ -130,8 +124,8 @@ def mem_usage(start_sect, stop_sect, segments, legalSegs=[], reqSegs=[], ih=None
                     sym = 'X'
                     if ih is not None:
                         content = ih.tobinstr(a, a+255)
-                        if content == '\xff'*len(content): sym = 'F'
-                        elif content == '\x00'*len(content): sym = '0'
+                        if content == b'\xff'*len(content): sym = 'F'
+                        elif content == b'\x00'*len(content): sym = '0'
 
                 if overlap:
                     ret += sym if max([calc_overlap([a, a + 256], seg) for seg in legalSegs]) else TermColors.FAIL + sym + TermColors.RESET
@@ -190,9 +184,9 @@ if __name__ == "__main__":
 
     def auto_usrId(usrId):
         usrId = usrId.strip()
-        if ':' in usrId: usrId = ''.join([chr(int(x, 16)) for x in usrId.split(':')][:4])
-        else: usrId = usrId[:4]
-        return '\x00' * (4-len(usrId)) + usrId
+        if ':' in usrId: usrId = bytes([int(x, 16) for x in usrId.split(':')][:4])
+        else: usrId = usrId[:4].encode()
+        return b'\x00' * (4-len(usrId)) + usrId
 
     def strip_path_filetype(*args, **kwargs):
         ft = argparse.FileType(*args, **kwargs)
@@ -206,7 +200,7 @@ if __name__ == "__main__":
     #helper functions to aide in printing to the console
     def print_metadata(metaVector):
         hdr = metaVector._asdict()
-        hdr['usrId'] = ':'.join(['%02X' % ord(x) for x in hdr['usrId']])
+        hdr['usrId'] = ':'.join(['%02X' % x for x in hdr['usrId']])
         print(textwrap.dedent("""
         The script has calculated the 16 Byte OAD Metadata vector below
 
@@ -389,7 +383,7 @@ if __name__ == "__main__":
 
 
     usrId = vargs.usrId
-    imgAddr = startAddr / 4  # In words
+    imgAddr = startAddr // 4  # In words
     imgType = imgTypes[vargs.imgtype]
     crcShdw = 0xffff
 

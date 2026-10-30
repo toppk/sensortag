@@ -1,0 +1,158 @@
+#!/usr/bin/python3
+"""Listen for SensorTag beacons and print each new reading or info packet.
+
+usage: sensortag-watch [--json] [--once] [--all] [--timeout S] [--adapter hciN] [ADDR...]
+       sensortag-watch --tui [--adapter hciN] [ADDR...]
+
+  (default)    one line per new packet
+  --json       one JSON object per line, for scripts and agents
+  --tui        live table of every tag heard
+  --once       exit after the first reading (with --timeout, exit 1 if none came)
+  --all        print every advert, not just new ones
+  --adapter    scan only this Bluetooth adapter (default: all of them, so one deaf adapter can't hide a tag)
+  ADDR         only these tags (default: any tag sending our formats)
+
+Payload formats and the Python API are in sensortag.py; docs/programming.md is the guide.
+Every JSON object has "type": "reading", "info" or "stock".
+"""
+import asyncio
+import json
+import sys
+import time
+
+from sensortag import Watcher, list_adapters
+
+STATUS_EVERY = 30  # s between TUI status refreshes
+QUIET = 90  # s without a new reading before the line output says what the scanner does hear
+
+
+def fmt(v, unit, places=1):
+    return "--" if v is None else f"{v:.{places}f}{unit}"
+
+
+def line(p):
+    t = time.strftime("%H:%M:%S", time.localtime(p["time"]))
+    if p["type"] == "stock":
+        return f"{t} {p['addr']} stock TI firmware (no readings), keys {p['keys']:#04x}, rssi {p['rssi']}"
+    if p["type"] == "unknown":
+        return f"{t} {p['addr']} unknown format {p['format']} (newer firmware?): {p['data']}, rssi {p['rssi']}"
+    if p["type"] == "info":
+        return (f"{t} {p['addr']} info: app {p['app_version']} git {p['git']}{'+dirty' if p['dirty'] else ''}, "
+                f"sdk {p['sdk_version']}, stack at {p['stack_start']}, self-test {','.join(p['self_test']) or 'none'}, "
+                f"reset: {p['reset_source']}, up {p['uptime_s']}s, presses {p['presses']}")
+    return (f"{t} {p['addr']} {fmt(p['temp_c'], '°C')} {fmt(p['humidity_pct'], '%RH')} "
+            f"{fmt(p['lux'], ' lux', 0)} {fmt(p['battery_v'], 'V', 2)} seq {p['seq']} rssi {p['rssi']} via {p['via']}"
+            + (" (connect mode)" if p.get("mode") == "connect" else "")
+            + (f" (missed {p['missed']})" if p.get("missed") else ""))
+
+
+async def stream(w, as_json, once, every, timeout):
+    deadline = time.monotonic() + timeout if timeout else None
+    print(f"listening for SensorTags on {', '.join(w.adapters)}; beacon mode sends a reading once a minute",
+          file=sys.stderr, flush=True)
+    printed = time.monotonic()
+    while True:
+        left = printed + QUIET - time.monotonic()
+        if deadline is not None:
+            if deadline <= time.monotonic():
+                sys.exit(1)
+            left = min(left, deadline - time.monotonic())
+        try:
+            fresh, p = await asyncio.wait_for(w.queue.get(), max(left, 0))
+        except asyncio.TimeoutError:
+            if time.monotonic() - printed >= QUIET:
+                print(w.status(time.monotonic() - printed), file=sys.stderr, flush=True)
+                printed = time.monotonic()
+            continue
+        if not (fresh or every):
+            continue
+        print(json.dumps(p) if as_json else line(p), flush=True)
+        if fresh:
+            printed = time.monotonic()
+            w.reset_heard()
+        if once and p["type"] == "reading":
+            return
+
+
+async def tui(w):
+    from rich.console import Group
+    from rich.live import Live
+    from rich.table import Table
+    from rich.text import Text
+
+    def render():
+        now = time.time()
+        r = Table(title="SensorTag readings", expand=False)
+        for c in ("tag", "mode", "temp", "humidity", "light", "battery", "seq", "readings", "missed", "rssi", "heard"):
+            r.add_column(c, justify="left" if c == "tag" else "right")
+        i = Table(title="System info (press button 2)", expand=False)
+        for c in ("tag", "app", "git", "sdk", "stack", "self-test", "reset", "uptime", "presses"):
+            i.add_column(c, justify="left" if c in ("tag", "self-test", "reset") else "right")
+        for a, tag in sorted(w.tags.items()):
+            age = max(0, now - tag["heard"])
+            heard = Text(f"{age:.0f}s ago", style="red" if age > 90 else "green")
+            if "stock" in tag:
+                r.add_row(a, Text("stock TI firmware", style="yellow"), *[""] * 5, str(tag["count"]), "",
+                          str(tag["rssi"]), heard)
+            elif "reading" in tag:
+                p = tag["reading"]
+                r.add_row(a, p.get("mode", "?"), fmt(p["temp_c"], " °C"), fmt(p["humidity_pct"], " %RH"), fmt(p["lux"], " lux", 0),
+                          fmt(p["battery_v"], " V", 2), str(p["seq"]), str(tag["count"]),
+                          Text(str(tag["missed"]), style="red" if tag["missed"] else ""), str(tag["rssi"]), heard)
+            if "info" in tag:
+                p = tag["info"]
+                up = p["uptime_s"] + int(now - p["time"])
+                i.add_row(a, p["app_version"], p["git"] + ("+" if p["dirty"] else ""), p["sdk_version"],
+                          p["stack_start"], ",".join(p["self_test"]), p["reset_source"],
+                          f"{up // 86400}d {up // 3600 % 24:02d}:{up // 60 % 60:02d}", str(p["presses"]))
+        if not w.tags:
+            r.add_row(Text("listening…", style="grey50"), *[""] * 10)
+        parts = [r] + ([i] if i.row_count else []) + [Text(status, style="grey50"), Text("ctrl-c to quit", style="grey50")]
+        return Group(*parts)
+
+    status, since = "listening; beacon mode sends a reading once a minute", time.monotonic()
+    with Live(render(), auto_refresh=False) as live:
+        while True:
+            try:
+                await asyncio.wait_for(w.queue.get(), 1)
+            except asyncio.TimeoutError:
+                pass
+            if time.monotonic() - since >= STATUS_EVERY:
+                status, since = w.status(time.monotonic() - since), time.monotonic()
+            live.update(render(), refresh=True)
+
+
+def main():
+    a = sys.argv[1:]
+    opts = {"--json", "--once", "--all", "--tui"}
+    timeout = None
+    if "--timeout" in a:
+        i = a.index("--timeout")
+        try:
+            timeout = float(a[i + 1])
+        except (IndexError, ValueError):
+            sys.exit(__doc__)
+        del a[i:i + 2]
+    adapters = list_adapters()
+    if "--adapter" in a:
+        i = a.index("--adapter")
+        if i + 1 >= len(a) or a[i + 1] not in adapters:
+            sys.exit(f"sensortag-watch: --adapter takes one of {', '.join(adapters) or '(none found)'}")
+        adapters = [a[i + 1]]
+        del a[i:i + 2]
+    if not adapters:
+        sys.exit("sensortag-watch: no Bluetooth adapters in /sys/class/bluetooth")
+    flags = {x for x in a if x.startswith("-")}
+    if flags - opts or ("--tui" in flags and flags & {"--json", "--once", "--all"}):
+        sys.exit(__doc__)
+    async def run():
+        async with Watcher([x for x in a if not x.startswith("-")], adapters) as w:
+            await (tui(w) if "--tui" in flags else stream(w, "--json" in flags, "--once" in flags, "--all" in flags, timeout))
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
